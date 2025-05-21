@@ -16,6 +16,7 @@
 		"wrangler": "^4.6.0"
 	},
 	"dependencies": {
-		"@logto/node": "latest"
+		"@logto/node": "latest",
+		"hono": "^4.7.10"
 	}
 }

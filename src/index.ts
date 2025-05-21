@@ -1,10 +1,45 @@
+import { Hono } from 'hono';
+
 export interface Env {
   USER_NOTIFICATION: KVNamespace;
 }
 
 import type { UserInfoResponse } from '@logto/node';
 
-const logtoEndpoint = 'https://es50q2.logto.app'; // 替换为您的 Logto 端点
+// Logto 管理 API 配置
+const logtoConfig = {
+  appId: 'uvyv6ldta8f2hhkchbh7f',
+  tenantId: 'es50q2',
+  appSecret: '7y7UMXNBku2jVS1iuZgfHXfmztgRZVgH',
+};
+
+const logtoEndpoint = 'https://es50q2.logto.app';
+const tokenEndpoint = `${logtoEndpoint}/oidc/token`;
+const applicationId = logtoConfig.appId;
+const applicationSecret = logtoConfig.appSecret;
+const tenantId = logtoConfig.tenantId;
+
+// 获取管理 API access token
+const fetchManagementAccessToken = async (): Promise<string> => {
+  const res = await fetch(tokenEndpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Authorization': `Basic ${btoa(`${applicationId}:${applicationSecret}`)}`,
+    },
+    body: new URLSearchParams({
+      grant_type: 'client_credentials',
+      resource: `https://${tenantId}.logto.app/api`,
+      scope: 'all',
+    }).toString(),
+  });
+  if (!res.ok) {
+    throw new Error('获取管理 access_token 失败');
+  }
+  const data: any = await res.json();
+  return data.access_token;
+};
+
 const userInfoEndpoint = `${logtoEndpoint}/oidc/me`;
 
 const getUserInfo = async (request: Request): Promise<UserInfoResponse> => {
@@ -13,12 +48,13 @@ const getUserInfo = async (request: Request): Promise<UserInfoResponse> => {
     throw new Error('无效的授权请求头'); // 中文注释
   }
 
+  // 用户的 access token，仅能获取用户自己的信息
   const token = authHeader.split(' ')[1];
   console.log('token', token); // 调试用，可以移除
-  
+
   // 获取用户信息请求
-  const response = await fetch(`${userInfoEndpoint}`, { 
-    headers: { 
+  const response = await fetch(`${userInfoEndpoint}`, {
+    headers: {
       'Authorization': `Bearer ${token}`
     }
   });
@@ -33,79 +69,197 @@ const getUserInfo = async (request: Request): Promise<UserInfoResponse> => {
   return userInfo as UserInfoResponse;
 }
 
-export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    try {
-      const url = new URL(request.url);
+// 获取用户自定义数据
+const fetchUserCustomData = async (accessToken: string, userId: string) => {
+  const res = await fetch(`${logtoEndpoint}/api/users/${userId}/custom-data`, {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+    },
+  });
+  if (!res.ok) {
+    throw new Error('获取用户自定义数据失败');
+  }
+  return await res.json();
+};
 
-    if (url.pathname.startsWith('/v1/')) {
-      let userInfo: UserInfoResponse;
-      try {
-        userInfo = await getUserInfo(request);
-      } catch (err) {
-        console.error('令牌验证或用户信息获取错误:', err); // 中文注释
-        const message = err instanceof Error ? err.message : '未知的认证错误';
-        if (message === '无效的授权请求头' || message === '获取用户信息失败') { // 匹配中文错误信息
-          return new Response(message, { status: 401, headers: { "Content-Type": "text/plain; charset=utf-8" } });
-        }
-        return new Response('令牌验证或用户信息获取过程中发生错误。', { status: 500, headers: { "Content-Type": "text/plain; charset=utf-8" } });
-      }
+// 更新用户自定义数据（部分更新）
+const patchUserCustomData = async (accessToken: string, userId: string, customData: Record<string, any>) => {
+  const res = await fetch(`${logtoEndpoint}/api/users/${userId}/custom-data`, {
+    method: 'PATCH',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${accessToken}`,
+    },
+    body: JSON.stringify({ customData }),
+  });
+  if (!res.ok) {
+    throw new Error('更新用户自定义数据失败');
+  }
+  return await res.json();
+};
 
-      // 令牌有效，用户信息已获取
-      if (url.pathname === '/v1/tikpic') {
-        let tikpicCount = 0; // 默认返回 0
-        const customData = userInfo.custom_data as Record<string, any> | undefined;
+// 获取或初始化 puzzleCount
+const getOrInitPuzzleCount = async (accessToken: string, userId: string): Promise<number> => {
+  let customData: any = await fetchUserCustomData(accessToken, userId);
+  if (typeof customData.puzzleCount !== 'number') {
+    // 没有拼图次数，初始化为 1
+    customData = await patchUserCustomData(accessToken, userId, { puzzleCount: 1 });
+    return 1;
+  }
+  return customData.puzzleCount;
+};
 
-        if (customData && typeof customData.tikpic_count === 'number') {
-          tikpicCount = customData.tikpic_count;
-        }
-        // 直接返回数字，内容类型为 text/plain
-        return new Response(tikpicCount.toString(), {
-          headers: { 'Content-Type': 'text/plain; charset=utf-8' },
-        });
-      } else {
-        // 对于其他 /v1/* 路径，返回完整的用户信息
-        return new Response(JSON.stringify(userInfo), {
-          headers: { 'Content-Type': 'application/json; charset=utf-8' },
-        });
-      }
-    } else if (url.pathname === '/v1/kv-example') {
-      // KV 存储示例
-      try {
-        await env.USER_NOTIFICATION.put("user_kv_example", "KV 存储功能正常！"); // 中文示例值
-        const value = await env.USER_NOTIFICATION.get("user_kv_example");
-        if (value === null) {
-          return new Response("写入KV后未找到值！", { status: 500, headers: { "Content-Type": "text/plain; charset=utf-8" } });
-        }
-        return new Response(`KV 示例：获取到的值: '${value}'`, { headers: { "Content-Type": "text/plain; charset=utf-8" } });
-      } catch (err) {
-        console.error(`KV 操作返回错误:`, err); // 中文注释
-        const errorMessage =
-          err instanceof Error
-            ? err.message
-            : "访问KV存储时发生未知错误"; // 中文注释
-        return new Response(errorMessage, {
-          status: 500,
-          headers: { "Content-Type": "text/plain; charset=utf-8" },
-        });
-      }
-    } else if (url.pathname === '/') {
-      return new Response("欢迎！这是根路径。API 端点位于 /v1/ 之下。", { // 中文欢迎信息
-        status: 200, 
-        headers: { "Content-Type": "text/plain; charset=utf-8" } 
-      });
+// 使用一次 puzzleCount
+const usePuzzleCount = async (accessToken: string, userId: string): Promise<number> => {
+  let customData: any = await fetchUserCustomData(accessToken, userId);
+  let count = typeof customData.puzzleCount === 'number' ? customData.puzzleCount : 0;
+  if (count > 0) {
+    count -= 1;
+    await patchUserCustomData(accessToken, userId, { puzzleCount: count });
+    return count;
+  } else {
+    throw new Error('拼图次数不足，无法使用');
+  }
+};
+
+// 增加 puzzleCount
+const addPuzzleCount = async (accessToken: string, userId: string, addNum: number = 1): Promise<number> => {
+  let customData: any = await fetchUserCustomData(accessToken, userId);
+  let count = typeof customData.puzzleCount === 'number' ? customData.puzzleCount : 0;
+  count += addNum;
+  await patchUserCustomData(accessToken, userId, { puzzleCount: count });
+  return count;
+};
+
+const app = new Hono<{ Bindings: Env }>();
+
+// 用户认证中间件，检查 token 并缓存用户信息到 KV
+const authMiddleware = async (c: any, next: any) => {
+  const authHeader = c.req.header('Authorization');
+  if (!authHeader?.startsWith('Bearer ')) {
+    return c.text('无效的授权请求头', 401);
+  }
+  const token = authHeader.split(' ')[1];
+  try {
+    const userInfo = await getUserInfoWithCache(c, token);
+    c.set('userInfo', userInfo); // 挂到 context
+    await next();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : '认证失败';
+    return c.text(msg, 401);
+  }
+};
+
+// 应用到所有 /v1 路由
+app.use('/v1/*', authMiddleware);
+
+// 声明 Hono Context 变量类型，支持 c.get('userInfo')
+declare module 'hono' {
+  interface ContextVariableMap {
+    userInfo: UserInfoResponse;
+  }
+}
+
+// /v1/puzzle-count GET 路由（KV 优先，用户信息也缓存）
+app.get('/v1/puzzle-count', async (c) => {
+  try {
+    const userInfo = c.get('userInfo');
+    const userId = userInfo.sub;
+    const kvKey = `puzzleCount:${userId}`;
+    // 先查 KV
+    let countStr = await c.env.USER_NOTIFICATION.get(kvKey);
+    if (countStr !== null) {
+      // KV 命中，直接返回
+      return c.text(countStr);
     }
+    // KV 没有，去 Logto 拉
+    const accessToken = await fetchManagementAccessToken();
+    const count = await getOrInitPuzzleCount(accessToken, userId);
+    // 写入 KV，设置 30 天过期
+    await c.env.USER_NOTIFICATION.put(kvKey, count.toString(), { expirationTtl: 2592000 });
+    return c.text(count.toString());
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : '获取拼图次数失败';
+    return c.text(msg, 500);
+  }
+});
 
-    return new Response("未找到。请求的资源不存在。", { // 中文404信息
-      status: 404, 
-      headers: { "Content-Type": "text/plain; charset=utf-8" } 
+// /v1/puzzle-count/use POST 路由（KV 优先，异步同步 Logto）
+app.post('/v1/puzzle-count/use', async (c) => {
+  try {
+    const userInfo = c.get<any>('userInfo') as UserInfoResponse;
+    const userId = userInfo.sub;
+    const kvKey = `puzzleCount:${userId}`;
+    // 先查 KV
+    let countStr = await c.env.USER_NOTIFICATION.get(kvKey);
+    let count = countStr ? parseInt(countStr, 10) : 0;
+    if (isNaN(count) || count <= 0) {
+      return c.text('拼图次数不足，无法使用', 400);
+    }
+    count -= 1;
+    await c.env.USER_NOTIFICATION.put(kvKey, count.toString(), { expirationTtl: 2592000 });
+    // 异步同步到 Logto
+    Promise.resolve().then(async () => {
+      try {
+        const accessToken = await fetchManagementAccessToken();
+        await patchUserCustomData(accessToken, userId, { puzzleCount: count });
+      } catch { }
     });
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : '验证令牌时发生未知错误';
-      return new Response(errorMessage, { 
-        status: 500, 
-        headers: { "Content-Type": "text/plain; charset=utf-8" } 
-      });
-    }
-  },
-} satisfies ExportedHandler<Env>;
+    return c.text(count.toString());
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : '使用拼图次数失败';
+    return c.text(msg, 400);
+  }
+});
+
+// /v1/puzzle-count/add POST 路由（KV 优先，异步同步 Logto）
+app.post('/v1/puzzle-count/add', async (c) => {
+  try {
+    const userInfo = c.get<any>('userInfo') as UserInfoResponse;
+    const userId = userInfo.sub;
+    const kvKey = `puzzleCount:${userId}`;
+    // 先查 KV
+    let countStr = await c.env.USER_NOTIFICATION.get(kvKey);
+    let count = countStr ? parseInt(countStr, 10) : 0;
+    let addNum = 1;
+    try {
+      const body: any = await c.req.json();
+      if (typeof body.addNum === 'number' && body.addNum > 0) {
+        addNum = body.addNum;
+      }
+    } catch { }
+    count += addNum;
+    await c.env.USER_NOTIFICATION.put(kvKey, count.toString(), { expirationTtl: 2592000 });
+    // 异步同步到 Logto
+    Promise.resolve().then(async () => {
+      try {
+        const accessToken = await fetchManagementAccessToken();
+        await patchUserCustomData(accessToken, userId, { puzzleCount: count });
+      } catch { }
+    });
+    return c.text(count.toString());
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : '增加拼图次数失败';
+    return c.text(msg, 400);
+  }
+});
+
+// 优先用 KV 缓存获取用户信息
+const getUserInfoWithCache = async (c: any, token: string): Promise<UserInfoResponse> => {
+  const kvKey = `userInfo:${token}`;
+  // 先查 KV
+  const cached = await c.env.USER_NOTIFICATION.get(kvKey);
+  if (cached) {
+    try {
+      return JSON.parse(cached);
+    } catch { }
+  }
+  // 没有缓存，去 Logto 拉
+  const userInfo = await getUserInfo(new Request(c.req.url, { headers: { Authorization: `Bearer ${token}` } }));
+  // 写入 KV，设置 1 小时过期
+  await c.env.USER_NOTIFICATION.put(kvKey, JSON.stringify(userInfo), { expirationTtl: 3600 });
+  return userInfo;
+};
+
+export default app;
