@@ -14,7 +14,7 @@ const getUserInfo = async (request: Request): Promise<UserInfoResponse> => {
   }
 
   const token = authHeader.split(' ')[1];
-  // console.log('token', token); // 调试用，可以移除
+  console.log('token', token); // 调试用，可以移除
   
   // 获取用户信息请求
   const response = await fetch(`${userInfoEndpoint}`, { 
@@ -28,14 +28,15 @@ const getUserInfo = async (request: Request): Promise<UserInfoResponse> => {
   }
 
   const userInfo = await response.json();
-  // console.log('userInfo', userInfo);  // 调试用，可以移除
+  console.log('userInfo', userInfo);  // 调试用，可以移除
 
   return userInfo as UserInfoResponse;
 }
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    const url = new URL(request.url);
+    try {
+      const url = new URL(request.url);
 
     if (url.pathname.startsWith('/v1/')) {
       let userInfo: UserInfoResponse;
@@ -99,5 +100,12 @@ export default {
       status: 404, 
       headers: { "Content-Type": "text/plain; charset=utf-8" } 
     });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : '验证令牌时发生未知错误';
+      return new Response(errorMessage, { 
+        status: 500, 
+        headers: { "Content-Type": "text/plain; charset=utf-8" } 
+      });
+    }
   },
 } satisfies ExportedHandler<Env>;
