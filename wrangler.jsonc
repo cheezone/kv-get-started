@@ -12,8 +12,16 @@
 	},
 	"kv_namespaces": [
 		{
-		"binding": "USER_NOTIFICATION",
-		"id": "1d3110ef0a6f4506973477d3fb65c8f3"
+			"binding": "USER_NOTIFICATION",
+			"id": "1d3110ef0a6f4506973477d3fb65c8f3"
+		}
+	],
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "main_db",
+			"database_id": "d4523a56-1992-48cc-8e0f-c0efb1102159",
+			"migrations_dir": "migrations"
 		}
 	]
 }

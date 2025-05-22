@@ -2,6 +2,9 @@ import { Hono } from 'hono';
 
 export interface Env {
   USER_NOTIFICATION: KVNamespace;
+  DB: D1Database;
+  DOUYIN_API_KEY?: string;
+  DOUYIN_WTF_BASE_URL?: string;
 }
 
 import type { UserInfoResponse } from '@logto/node';
@@ -144,6 +147,36 @@ const authMiddleware = async (c: any, next: any) => {
   try {
     const userInfo = await getUserInfoWithCache(c, token);
     c.set('userInfo', userInfo); // 挂到 context
+
+    // 从 D1 获取用户余额
+    const userId = userInfo.sub;
+    let balance = 0; // 默认余额为 0
+    try {
+      // 确保查询只选择 balance 列，或者返回整个对象然后访问 balance
+      // 如果只想获取 balance 列的值，可以使用 first('balance')
+      // const userBalance = await c.env.DB.prepare('SELECT balance FROM balances WHERE user_id = ?').bind(userId).first('balance');
+      // if (typeof userBalance === 'number') {
+      //   balance = userBalance;
+      // }
+      // 或者，获取整行记录
+      const result = await c.env.DB.prepare('SELECT balance FROM balances WHERE user_id = ?').bind(userId).first();
+      if (result && typeof (result as any).balance === 'number') {
+        balance = (result as any).balance;
+      } else {
+        // 如果 balances 表中没有该用户，可以考虑在此处创建一条记录，并赋予初始余额
+        // 例如：await c.env.DB.prepare('INSERT INTO balances (user_id, balance) VALUES (?, ?)')
+        //           .bind(userId, 0) // 假设初始余额为0
+        //           .run();
+        // 为了简单起见，这里我们只设置默认值0，具体初始化逻辑可以根据业务需求调整
+        console.log(`User ${userId} not found in balances table or balance is not a number, defaulting to balance 0.`);
+      }
+    } catch (dbError) {
+      console.error(`Error fetching balance for user ${userId} from D1:`, dbError);
+      // 根据错误处理策略，可以选择返回错误或使用默认余额继续
+      // return c.text('获取用户余额失败', 500);
+    }
+    c.set('balance', balance); // 将余额挂到 context
+
     await next();
   } catch (err) {
     const msg = err instanceof Error ? err.message : '认证失败';
@@ -158,6 +191,7 @@ app.use('/v1/*', authMiddleware);
 declare module 'hono' {
   interface ContextVariableMap {
     userInfo: UserInfoResponse;
+    balance: number;
   }
 }
 
@@ -262,4 +296,117 @@ const getUserInfoWithCache = async (c: any, token: string): Promise<UserInfoResp
   return userInfo;
 };
 
+// Helper function to get environment variables
+const getEnv = (c: any) => {
+  return {
+    DOUYIN_WTF_BASE_URL: c.env.DOUYIN_WTF_BASE_URL || 'https://douyin.wtf', // 提供一个默认值或确保环境变量已设置
+    // 可以添加其他需要的环境变量
+  };
+};
+
+// ... app.post('/v1/media/direct-download-info', ...)
+app.post('/v1/media/direct-download-info', async (c) => {
+  const endpointName = '/v1/media/direct-download-info';
+  try {
+    const userInfo = c.get('userInfo');
+    const userId = userInfo.sub;
+    let currentBalance = c.get('balance');
+    console.log(`[${endpointName}] User: ${userId}, Balance: ${currentBalance} initiated.`);
+
+    const body = await c.req.json();
+    const mediaUrl = body.url;
+    console.log(`[${endpointName}] Received mediaUrl: ${mediaUrl}`);
+
+    if (!mediaUrl || typeof mediaUrl !== 'string') {
+      console.error(`[${endpointName}] Invalid mediaUrl: ${mediaUrl}`);
+      return c.json({ error: '缺少或无效的媒体链接' }, 400);
+    }
+
+    // --- 0. 前置余额检查 --- (如果严格要求余额不足时不进行任何解析)
+    const preliminaryCost = 1; // 假设固定成本为1，用于预检
+    if (currentBalance < preliminaryCost) {
+      console.warn(`[${endpointName}] Preliminary check: Balance insufficient for user ${userId}. Balance: ${currentBalance}, Cost: ${preliminaryCost}`);
+      return c.json({ error: '余额不足，无法进行解析操作', currentBalance: currentBalance, required: preliminaryCost }, 402);
+    }
+
+    // --- 1. 解析媒体链接 ---
+    // ... (后续的解析、提取下载链接、最终扣费逻辑不变，但在扣费前仍会再次检查余额，以防并发)
+    // ... (确保在最终扣费的 const cost = 1; 之后，仍然有 if (currentBalance < cost) 的检查)
+    // ... (因为这里的 currentBalance 是从 context 获取的，可能在预检后到实际扣费前被其他操作改变，虽然单次请求内不太可能，但保持严谨)
+
+    let parsedMediaData: any;
+    let parseSource: string;
+    const cache = caches.default;
+    const cacheKeyRequest = new Request(new URL(mediaUrl).toString(), { method: 'GET' });
+    let cacheResponse = await cache.match(cacheKeyRequest);
+
+    if (cacheResponse) {
+      console.log(`[${endpointName}] Cache HIT for: ${mediaUrl}`);
+      parsedMediaData = await cacheResponse.json();
+      parseSource = 'cache';
+    } else {
+      // ... (调用第三方 API 的逻辑)
+      console.log(`[${endpointName}] Cache MISS for: ${mediaUrl}. Fetching from API.`);
+      const { DOUYIN_WTF_BASE_URL } = getEnv(c);
+      const targetApiUrl = new URL('/api/hybrid/video_data', DOUYIN_WTF_BASE_URL);
+      targetApiUrl.searchParams.set('url', mediaUrl);
+      console.log(`[${endpointName}] Calling Douyin.wtf API: ${targetApiUrl.toString()}`);
+      const headers = new Headers();
+      if (c.env.DOUYIN_API_KEY) {
+        headers.set('Authorization', `Bearer ${c.env.DOUYIN_API_KEY}`);
+        console.log(`[${endpointName}] Using DOUYIN_API_KEY.`);
+      }
+      const apiResponse = await fetch(targetApiUrl.toString(), { headers });
+      console.log(`[${endpointName}] Douyin.wtf API response status: ${apiResponse.status} for ${mediaUrl}`);
+
+      if (!apiResponse.ok) {
+        const errorText = await apiResponse.text();
+        console.error(`[${endpointName}] Douyin.wtf API error for ${mediaUrl}: ${apiResponse.status}, Body: ${errorText}`);
+        return c.json({ error: `解析媒体链接失败 (API Code: ${apiResponse.status})`, details: errorText }, 502);
+      }
+      const responseText = await apiResponse.text();
+      try {
+        parsedMediaData = JSON.parse(responseText);
+        console.log(`[${endpointName}] Successfully parsed JSON response for ${mediaUrl}.`);
+      } catch (jsonErr) {
+        console.error(`[${endpointName}] Failed to parse JSON from Douyin.wtf API for ${mediaUrl}. Response text: ${responseText}`, jsonErr);
+        return c.json({ error: '解析第三方API响应失败，非JSON格式', details: responseText }, 502);
+      }
+      parseSource = 'api';
+      console.log(`[${endpointName}] Attempting to cache response for ${mediaUrl}`);
+      const responseToCache = new Response(JSON.stringify(parsedMediaData), {
+        status: apiResponse.status,
+        statusText: apiResponse.statusText,
+        headers: apiResponse.headers
+      });
+      responseToCache.headers.set('Cache-Control', 'public, max-age=900');
+      c.executionCtx.waitUntil(cache.put(cacheKeyRequest, responseToCache));
+      console.log(`[${endpointName}] Cache PUT initiated for ${mediaUrl}`);
+    }
+
+    // ... (提取 finalDownloadUrl, mediaTitle, mediaCover, extractedMediaType 的逻辑)
+    // ... (再次检查 finalDownloadUrl 是否有效)
+    // ... (最终的扣费逻辑，这里会再次检查 currentBalance，这是对的)
+    const cost = 1;
+    // currentBalance 应该从 c.get('balance') 重新获取，以防在长解析过程中被其他并发操作修改
+    // 但对于单个 Worker 请求生命周期，它在 authMiddleware 设置后通常不变，除非此 API 内部修改了它再读取
+    // 为了保险起见，可以重新获取一次，或者确保之前的 c.set('balance', newBalance) 没有在这个检查之前发生
+    const balanceForFinalDeduct = c.get('balance'); // 或者就是用上面从 context 开始时获取的 currentBalance
+
+    console.log(`[${endpointName}] Attempting to deduct cost: ${cost} for user ${userId} (balance: ${balanceForFinalDeduct}) for ${mediaUrl}`);
+    if (balanceForFinalDeduct < cost) {
+      // ... （返回402，附带parsedData等信息的逻辑）
+    }
+    // ... (执行扣费的 batch 操作)
+    // ... (后续代码)
+  } catch (err) {
+    console.error(`[${endpointName}] Unexpected error in ${endpointName}:`, err);
+    const msg = err instanceof Error ? err.message : '获取直接下载信息失败';
+    return c.json({ error: msg, details: err instanceof Error ? err.stack : undefined }, 500);
+  }
+});
+
 export default app;
+
+
+
